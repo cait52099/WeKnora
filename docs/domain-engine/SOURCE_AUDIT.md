@@ -26,3 +26,5 @@
 - 专业生命周期不可沿用 `KnowledgePostProcessService.Handle` 的完成状态。Wiki 可接管 finalizing，原生图谱、问题和摘要也有独立任务。上线时针对源替换、原生删除、任务迟到分别验证领域 fencing。
 
 Phase 2B 实际接入点为 `knowledge_create.go` 原生文件入队之前的领域意图、`knowledge_domain_capture.go` 的预切片快照、`router/task.go` 的领域 worker 与 `routes_domain.go` 的会话接口。清理由 `000139_domain_jobs` PostgreSQL 触发器覆盖，包括跨 KB/租户移动。
+
+Phase 2B.1 在 `knowledge_create.go` 预提交锁定意图，`knowledge_process.go` 处理目的 KB 的显式重新解析，`domainengine/reprocess.go` 原子提交复用结果。批次查询与完整包分别位于 `domainengine/dashboard.go` 和 `domainengine/package.go`。

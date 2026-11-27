@@ -29,3 +29,5 @@ Phase 2A 提供内部配置校验与持久层；Phase 2B 才发布本地领域�
 ## Phase 2B 实际接口
 
 工作区会话管理员可列出及读取发布修订，调用 `/domain-profiles/{validate,publish}` 和 `/domain-profiles/preview/{txt,docx,example}`。草稿编辑、复制和文件导出在浏览器完成。绑定和任务端点位于 `/knowledge-bases/:id/domain`，沿用 KB owner/admin 与 write grant。任务提供 `/jobs/:job/{runs,parse,retry,cancel,reprocess}` 和 `/runs/:attempt/{raw,valid}`。源文档预览使用现有知识详情权限。操作步骤见 [MVP 指南](MVP_GUIDE.md)。
+
+Phase 2B.1 的 `GET /jobs` 返回 `jobs`、`next`、`counts` 和 `usage`。筛选使用 `search`、`status`，向后翻页使用 `before`，同时间戳按任务 ID 稳定排序。批量重试 `POST /jobs/batch-retry` 接收最多 50 个 ID。完整配置包通过 `POST /domain-profiles/package/{preview,publish}` 和 `GET /domain-profiles/:profile/:revision/package` 在工作区管理员范围内导入导出。

@@ -36,6 +36,9 @@ type Profile struct {
 }
 
 type StageDefinition struct {
+	InputTokens    int                   `json:"input_tokens,omitempty"`
+	OutputTokens   int                   `json:"output_tokens,omitempty"`
+	TimeoutSeconds int                   `json:"timeout_seconds,omitempty"`
 	Partition      *ArrayPartition       `json:"partition,omitempty"`
 	SemanticChecks []SemanticCheck       `json:"semantic_checks,omitempty"`
 	ID             string                `json:"id"`
@@ -143,6 +146,9 @@ func validateStage(stage StageDefinition, previous map[string]StageDefinition) e
 		default:
 			return fmt.Errorf("input %q has an unknown source", name)
 		}
+	}
+	if stage.InputTokens < 0 || stage.InputTokens > 2_000_000 || stage.OutputTokens < 0 || stage.OutputTokens > 2_000_000 || stage.TimeoutSeconds < 0 || stage.TimeoutSeconds > 1800 {
+		return errors.New("invalid stage budget or timeout")
 	}
 	if err := validateSemanticChecks(stage); err != nil {
 		return err

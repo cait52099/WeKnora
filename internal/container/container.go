@@ -144,7 +144,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		if store == nil {
 			return nil
 		}
-		return &domainengine.Worker{Store: store, Models: service.DomainModels{Service: models}}
+		limit, _ := strconv.Atoi(os.Getenv("DOMAIN_TENANT_CONCURRENCY"))
+		return &domainengine.Worker{Store: store, Models: service.DomainModels{Service: models}, TenantConcurrency: limit}
 	}))
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))

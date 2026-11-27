@@ -16,16 +16,18 @@ type Dispatcher interface {
 }
 
 type Worker struct {
-	Store  *Store
-	Models Models
+	Store             *Store
+	Models            Models
+	TenantConcurrency int
 }
 
 type stageOutcome struct {
-	retryAfter  time.Duration
-	coverage    StageCoverage
-	state, code string
-	result      ModelResult
-	valid       []byte
+	modelCalls, reportedCalls int
+	retryAfter                time.Duration
+	coverage                  StageCoverage
+	state, code               string
+	result                    ModelResult
+	valid                     []byte
 }
 
 func (w *Worker) Handle(ctx context.Context, task *asynq.Task) error {
@@ -61,9 +63,9 @@ func (w *Worker) Run(ctx context.Context, id string) error {
 	if err = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('domain-tenant:' || $1::bigint::text,0))`, job.TenantID).Scan(&admitted); err != nil || !admitted {
 		return err
 	}
-	var busy bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM domain_engine.jobs WHERE tenant_id=$1
-		AND status='running' AND lease_until>now() AND id<>$2)`, job.TenantID, id).Scan(&busy); err != nil || busy {
+	var running int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM domain_engine.jobs WHERE tenant_id=$1
+		AND status='running' AND lease_until>now() AND id<>$2`, job.TenantID, id).Scan(&running); err != nil || running >= max(1, min(16, w.TenantConcurrency)) {
 		return err
 	}
 	if job.Status == "running" {
@@ -79,7 +81,7 @@ func (w *Worker) Run(ctx context.Context, id string) error {
 	}
 
 	fence++
-	_, err = tx.ExecContext(ctx, `UPDATE domain_engine.jobs SET status='running',fence=$2,retries=$3,lease_until=now()+interval '3 minutes'
+	_, err = tx.ExecContext(ctx, `UPDATE domain_engine.jobs SET status='running',fence=$2,retries=$3,lease_until=now()+interval '2 minutes'
 		WHERE id=$1`, id, fence, retries)
 	if err != nil {
 		return err
@@ -87,6 +89,36 @@ func (w *Worker) Run(ctx context.Context, id string) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
+
+	workCtx, cancelWork := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workCtx.Done():
+				return
+			case <-ticker.C:
+				hb, stop := context.WithTimeout(workCtx, 5*time.Second)
+				result, err := w.Store.db.ExecContext(hb, `UPDATE domain_engine.jobs target SET lease_until=now()+interval '2 minutes'
+					FROM domain_engine.jobs j`+liveJob+`WHERE target.id=j.id AND target.id=$1 AND target.fence=$2
+					AND target.status='running' AND target.lease_until>now()`, id, fence)
+				stop()
+				if err != nil {
+					cancelWork()
+					return
+				}
+				n, err := result.RowsAffected()
+				if err != nil || n != 1 {
+					cancelWork()
+					return
+				}
+			}
+		}
+	}()
+	defer func() { cancelWork(); <-done }()
 
 	p, err := w.Store.LoadProfile(ctx, job.TenantID, job.ProfileID, job.Revision)
 	if err != nil {
@@ -119,7 +151,7 @@ func (w *Worker) Run(ctx context.Context, id string) error {
 			WHERE j.id=$1 AND j.fence=$2 AND j.status='running' AND j.lease_until>now())`, id, fence).Scan(&current)
 		return current, err
 	}
-	result := w.execute(ctx, job.TenantID, p, stage, pins[stage.ID], input, retries, authorize)
+	result := w.execute(workCtx, job.TenantID, p, stage, pins[stage.ID], input, retries, authorize)
 	next := index
 	if result.state == "queued" && result.valid != nil {
 		next++
@@ -189,17 +221,26 @@ func (w *Worker) execute(ctx context.Context, tenant uint64, p *CompiledProfile,
 		instructions += "\nCheck the complete response against the output schema. Emit JSON only."
 	}
 	system := instructions + "\nOutput JSON Schema:\n" + string(stage.Schema)
-	call, cancel := context.WithTimeout(ctx, 75*time.Second)
+	pin, err = pin.ForStage(stage)
+	if err != nil {
+		return stageOutcome{state: "needs_review", code: "invalid_stage_model_budget"}
+	}
+	timeout := stage.TimeoutSeconds
+	if timeout == 0 {
+		timeout = 180
+	}
+	call, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
-	if !fitsInput(body, system, pin) {
+	estimated, estimator := estimateInput(body, system)
+	if estimated > pin.InputBudget {
 		if stage.Partition != nil {
 			return w.executePartition(call, tenant, p, stage, pin, system, input, retries, authorize)
 		}
-		return stageOutcome{state: "needs_review", code: "complete_input_exceeds_budget", coverage: StageCoverage{Mode: "not_sent", TotalBytes: len(body)}}
+		return stageOutcome{state: "needs_review", code: "complete_input_exceeds_budget", coverage: StageCoverage{Mode: "not_sent", TotalBytes: len(body), EstimatedTokens: estimated, BudgetTokens: pin.InputBudget, Estimator: estimator}}
 	}
 	out := w.callModel(call, tenant, p, stage, pin, system, body, input, retries, authorize)
 	if out.code != "model_configuration_changed" {
-		out.coverage = StageCoverage{Mode: "full_payload", TotalBytes: len(body), Parts: 1}
+		out.coverage = StageCoverage{Mode: "full_payload", TotalBytes: len(body), Parts: 1, EstimatedTokens: estimated, BudgetTokens: pin.InputBudget, Estimator: estimator}
 		if out.result.Text != "" || out.result.ToolAttempt || out.result.FinishReason != "" {
 			out.coverage.CompletedBytes = len(body)
 			out.coverage.CompletedParts = 1
@@ -229,6 +270,12 @@ func (w *Worker) callModel(ctx context.Context, tenant uint64, p *CompiledProfil
 		return stageOutcome{state: "failed", code: "model_configuration_changed"}
 	}
 	out := stageOutcome{state: "retry_wait", result: result}
+	if result.Called {
+		out.modelCalls = 1
+	}
+	if result.Called && (result.PromptTokens > 0 || result.CompletionTokens > 0) {
+		out.reportedCalls = 1
+	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		out.code = "model_timeout"
@@ -292,8 +339,8 @@ func (w *Worker) finish(ctx context.Context, job Job, fence int64, next int, sta
 	if stage != "" {
 		coverage, _ := json.Marshal(out.coverage)
 		_, err = tx.ExecContext(ctx, `INSERT INTO domain_engine.stage_runs(job_id,fence,stage_index,stage_id,raw_response,valid_json,
-			prompt_tokens,completion_tokens,error_code,input_coverage) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)`, job.ID, fence, job.StageIndex, stage,
-			[]byte(out.result.Text), out.valid, out.result.PromptTokens, out.result.CompletionTokens, out.code, string(coverage))
+			prompt_tokens,completion_tokens,error_code,input_coverage,model_calls,reported_calls) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)`, job.ID, fence, job.StageIndex, stage,
+			[]byte(out.result.Text), out.valid, out.result.PromptTokens, out.result.CompletionTokens, out.code, string(coverage), out.modelCalls, out.reportedCalls)
 		if err != nil {
 			return err
 		}
@@ -325,7 +372,7 @@ func (w *Worker) Dispatch(ctx context.Context, queue Dispatcher) error {
 	}
 	var failures int
 	for _, id := range ids {
-		if _, err = queue.Enqueue(asynq.NewTask(TaskType, []byte(id)), asynq.Queue(Queue), asynq.MaxRetry(0), asynq.Timeout(2*time.Minute)); err != nil {
+		if _, err = queue.Enqueue(asynq.NewTask(TaskType, []byte(id)), asynq.Queue(Queue), asynq.MaxRetry(0), asynq.Timeout(32*time.Minute)); err != nil {
 			failures++
 		}
 	}
@@ -339,6 +386,12 @@ func (w *Worker) Dispatch(ctx context.Context, queue Dispatcher) error {
 	if err != nil {
 		return err
 	}
+	_, err = w.Store.db.ExecContext(ctx, `DELETE FROM domain_engine.jobs j WHERE j.created_at<now()-interval '24 hours'
+		AND j.parse_attempt IS NULL AND NOT EXISTS(SELECT 1 FROM knowledges k WHERE k.id=j.document_id AND k.tenant_id=j.tenant_id)`)
+	if err != nil {
+		return err
+	}
+
 	if failures > 0 {
 		return fmt.Errorf("%d domain wake dispatches failed", failures)
 	}
@@ -348,7 +401,7 @@ func (w *Worker) Dispatch(ctx context.Context, queue Dispatcher) error {
 func (w *Worker) dispatchNative(ctx context.Context, queue Dispatcher) error {
 	rows, err := w.Store.db.QueryContext(ctx, `UPDATE domain_engine.jobs SET native_wake_at=now()+interval '2 minutes',
 		native_wakes=native_wakes+1 WHERE id IN (SELECT j.id FROM domain_engine.jobs j`+liveJob+`
-		WHERE j.status='waiting_parse' AND j.native_payload IS NOT NULL AND j.native_wake_at<=now()
+		WHERE (j.status='waiting_parse' OR (j.status='failed' AND j.error_code='model_unavailable_at_submission')) AND j.native_payload IS NOT NULL AND j.native_wake_at<=now()
 		AND j.native_wakes<3 AND k.parse_status='pending'
 		ORDER BY j.native_wake_at LIMIT 25 FOR UPDATE OF j SKIP LOCKED) RETURNING native_payload,document_id,source_path,native_hash`)
 	if err != nil {

@@ -14,7 +14,7 @@ const (
 )
 
 func NativeTaskID(documentID, sourcePath, sourceHash string) string {
-	return "domain-native:" + digest([]byte(documentID+"\x00"+sourceHash))
+	return "domain-native:" + digest([]byte(documentID+"\x00"+sourcePath+"\x00"+sourceHash))
 }
 
 type ProviderFailure struct {
@@ -26,12 +26,38 @@ type ProviderFailure struct {
 func (e *ProviderFailure) Error() string { return e.Code }
 
 type ModelPin struct {
-	Fingerprint  string `json:"fingerprint"`
-	InputBudget  int    `json:"input_budget"`
-	OutputBudget int    `json:"output_budget"`
+	Fingerprint   string `json:"fingerprint"`
+	InputBudget   int    `json:"input_budget"`
+	OutputBudget  int    `json:"output_budget"`
+	ContextWindow int    `json:"context_window,omitempty"`
+}
+
+func (p ModelPin) ForStage(stage StageDefinition) (ModelPin, error) {
+	window := p.ContextWindow
+	if window == 0 {
+		window = p.InputBudget + p.OutputBudget
+	}
+	if stage.OutputTokens > 0 {
+		if stage.OutputTokens > p.OutputBudget {
+			return p, errors.New("stage output exceeds model capability")
+		}
+		p.OutputBudget = stage.OutputTokens
+	}
+	p.InputBudget = window - p.OutputBudget
+	if stage.InputTokens > 0 {
+		if stage.InputTokens > p.InputBudget {
+			return p, errors.New("stage input plus output exceeds model context")
+		}
+		p.InputBudget = stage.InputTokens
+	}
+	if p.InputBudget <= 0 || p.OutputBudget <= 0 {
+		return p, errors.New("invalid effective stage budget")
+	}
+	return p, nil
 }
 
 type ModelResult struct {
+	Called           bool
 	Text             string
 	FinishReason     string
 	PromptTokens     int
@@ -79,25 +105,54 @@ func (s *Store) Start(ctx context.Context, scope Scope, doc, path, hash string, 
 	return s.start(ctx, scope, doc, path, hash, models, "waiting_parse", nativePayload...)
 }
 
-func (s *Store) start(ctx context.Context, scope Scope, doc, path, hash string, models Models, initialStatus string, nativePayload ...[]byte) error {
-	b, err := s.Binding(ctx, scope)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+type submission struct {
+	binding       Binding
+	pins, options []byte
+	status, code  string
+}
+
+// PrepareUpload persists the original binding and model intent before native
+// creation. Until the matching native row commits, dispatch cannot see it.
+func (s *Store) PrepareUpload(ctx context.Context, scope Scope, doc, path, hash string, models Models, payload []byte) (bool, error) {
+	intent, err := s.prepare(ctx, scope, models, "waiting_parse")
+	if err != nil || intent == nil {
+		return false, err
 	}
-	if err != nil || !b.Enabled {
+	created, err := intent.insert(ctx, s.db, doc, path, hash, payload)
+	if err == nil && !created {
+		return false, ErrConflict
+	}
+	return created, err
+}
+
+func (s *Store) start(ctx context.Context, scope Scope, doc, path, hash string, models Models, status string, nativePayload ...[]byte) error {
+	intent, err := s.prepare(ctx, scope, models, status)
+	if err != nil || intent == nil {
 		return err
 	}
 	var payload []byte
 	if len(nativePayload) > 0 {
 		payload = nativePayload[0]
 	}
+	_, err = intent.insert(ctx, s.db, doc, path, hash, payload)
+	return err
+}
+
+func (s *Store) prepare(ctx context.Context, scope Scope, models Models, status string) (*submission, error) {
+	b, err := s.Binding(ctx, scope)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil || !b.Enabled {
+		return nil, err
+	}
 	p, err := s.LoadProfile(ctx, scope.TenantID, b.ProfileID, b.Revision)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pins := make(map[string]ModelPin)
 	options := make(map[string]bool)
-	jobState, code := initialStatus, ""
+	code := ""
 	for _, stage := range p.profile.Stages {
 		if stage.Optional && !stage.Enabled {
 			continue
@@ -105,20 +160,38 @@ func (s *Store) start(ctx context.Context, scope Scope, doc, path, hash string, 
 		options[stage.ID] = true
 		pin, err := models.Pin(ctx, scope.TenantID, stage.ModelRef)
 		if err != nil {
-			jobState, code = "failed", "model_unavailable_at_submission"
+			status, code = "failed", "model_unavailable_at_submission"
 			break
 		}
 		pins[stage.ID] = pin
 	}
 	pinJSON, _ := json.Marshal(pins)
 	optionJSON, _ := json.Marshal(options)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO domain_engine.jobs
+	return &submission{b, pinJSON, optionJSON, status, code}, nil
+}
+
+type intentWriter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (i *submission) insert(ctx context.Context, db intentWriter, doc, path, hash string, payload []byte) (bool, error) {
+	b := i.binding
+	result, err := db.ExecContext(ctx, `INSERT INTO domain_engine.jobs
 		(tenant_id,kb_id,document_id,source_path,native_hash,profile_id,revision,binding_version,access_epoch,model_pins,optional_stages,status,error_code,native_payload)
-		SELECT b.tenant_id,b.kb_id,k.id,k.file_path,k.file_hash,$11,$12,$6,b.access_epoch,$7::jsonb,$8::jsonb,$9,$10,$14
-		FROM domain_engine.kb_bindings b JOIN knowledges k ON k.tenant_id=b.tenant_id AND k.knowledge_base_id=b.kb_id
-		WHERE b.tenant_id=$1 AND b.kb_id=$2 AND k.id=$3 AND k.file_path=$4 AND k.file_hash=$5 AND b.access_epoch=$13 AND b.enabled
-		AND k.deleted_at IS NULL
-		ON CONFLICT DO NOTHING`, scope.TenantID, scope.KBID, doc, path, hash, b.Version, string(pinJSON), string(optionJSON), jobState, code, b.ProfileID, b.Revision, b.AccessEpoch, payload)
+		SELECT b.tenant_id,b.kb_id,$3,$4,$5,$11,$12,$6,b.access_epoch,$7::jsonb,$8::jsonb,$9,$10,$14
+		FROM domain_engine.kb_bindings b JOIN knowledge_bases kb ON kb.tenant_id=b.tenant_id AND kb.id=b.kb_id
+		WHERE b.tenant_id=$1 AND b.kb_id=$2 AND b.access_epoch=$13 AND b.enabled AND kb.deleted_at IS NULL
+		ON CONFLICT DO NOTHING`, b.TenantID, b.KBID, doc, path, hash, b.Version, string(i.pins), string(i.options), i.status, i.code, b.ProfileID, b.Revision, b.AccessEpoch, payload)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+func (s *Store) MarkUploadQueueFailure(ctx context.Context, scope Scope, doc string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE domain_engine.jobs SET error_code=CASE WHEN status='waiting_parse' THEN 'native_enqueue_retry' ELSE error_code END,native_wake_at=now()
+		WHERE tenant_id=$1 AND kb_id=$2 AND document_id=$3 AND (status='waiting_parse' OR (status='failed' AND error_code='model_unavailable_at_submission'))`, scope.TenantID, scope.KBID, doc)
 	return err
 }
 
@@ -191,4 +264,30 @@ func (s *Store) ChangeJob(ctx context.Context, scope Scope, id string, cancel bo
 		return ErrConflict
 	}
 	return err
+}
+
+// PrepareReparse uses an existing repair intent when present. A file moved
+// into a destination KB gets a first intent using that KB's active binding.
+func (s *Store) PrepareReparse(ctx context.Context, scope Scope, doc, path, hash string, models Models, payload []byte) (bool, error) {
+	var id, status string
+	err := s.db.QueryRowContext(ctx, `SELECT j.id,j.status FROM domain_engine.jobs j`+liveJob+`WHERE
+		j.tenant_id=$1 AND j.kb_id=$2 AND j.document_id=$3 AND j.source_path=$4 AND j.native_hash=$5
+		ORDER BY j.created_at DESC,j.id DESC LIMIT 1`, scope.TenantID, scope.KBID, doc, path, hash).Scan(&id, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s.PrepareUpload(ctx, scope, doc, path, hash, models, payload)
+	}
+	if err != nil {
+		return false, err
+	}
+	if status != "waiting_parse" && status != "capture_failed" {
+		return false, nil
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE domain_engine.jobs SET native_payload=$2,native_wakes=0,
+		native_wake_at=now()+interval '2 minutes',status='waiting_parse',error_code=''
+		WHERE id=$1 AND status IN ('waiting_parse','capture_failed')`, id, payload)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
 }

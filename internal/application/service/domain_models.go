@@ -43,11 +43,13 @@ func (m DomainModels) Pin(ctx context.Context, tenant uint64, id string) (domain
 	if out <= 0 {
 		out = 2048
 	}
-	out = min(out, 8192, window/2)
+	if out >= window {
+		out = window / 2
+	}
 	if out < 1 {
 		return domainengine.ModelPin{}, errors.New("insufficient model context")
 	}
-	return domainengine.ModelPin{Fingerprint: hex.EncodeToString(sum[:]), InputBudget: window - out, OutputBudget: out}, nil
+	return domainengine.ModelPin{Fingerprint: hex.EncodeToString(sum[:]), InputBudget: window - out, OutputBudget: out, ContextWindow: window}, nil
 }
 
 func (m DomainModels) Generate(ctx context.Context, tenant uint64, id string, pin domainengine.ModelPin, system, user string) (domainengine.ModelResult, error) {
@@ -56,7 +58,7 @@ func (m DomainModels) Generate(ctx context.Context, tenant uint64, id string, pi
 	if ctx.Err() != nil {
 		return domainengine.ModelResult{}, ctx.Err()
 	}
-	if err != nil || before != pin {
+	if err != nil || before.Fingerprint != pin.Fingerprint || pin.OutputBudget > before.OutputBudget {
 		return domainengine.ModelResult{}, domainengine.ErrModelChanged
 	}
 	provider, err := m.Service.GetChatModel(ctx, id)
@@ -67,7 +69,7 @@ func (m DomainModels) Generate(ctx context.Context, tenant uint64, id string, pi
 	if ctx.Err() != nil {
 		return domainengine.ModelResult{}, ctx.Err()
 	}
-	if err != nil || after != pin {
+	if err != nil || after != before {
 		return domainengine.ModelResult{}, domainengine.ErrModelChanged
 	}
 	resp, err := provider.Chat(ctx, []chat.Message{{Role: "system", Content: system}, {Role: "user", Content: user}}, &chat.ChatOptions{
@@ -78,17 +80,17 @@ func (m DomainModels) Generate(ctx context.Context, tenant uint64, id string, pi
 		if errors.As(err, &httpErr) {
 			switch {
 			case httpErr.StatusCode == 429:
-				return domainengine.ModelResult{}, &domainengine.ProviderFailure{Code: "provider_rate_limited", RetryAfter: httpErr.RetryAfter()}
+				return domainengine.ModelResult{Called: true}, &domainengine.ProviderFailure{Code: "provider_rate_limited", RetryAfter: httpErr.RetryAfter()}
 			case httpErr.StatusCode == 401 || httpErr.StatusCode == 403:
-				return domainengine.ModelResult{}, &domainengine.ProviderFailure{Code: "provider_auth_rejected", Permanent: true}
+				return domainengine.ModelResult{Called: true}, &domainengine.ProviderFailure{Code: "provider_auth_rejected", Permanent: true}
 			}
 		}
-		return domainengine.ModelResult{}, err
+		return domainengine.ModelResult{Called: true}, err
 	}
 
 	if resp == nil {
-		return domainengine.ModelResult{}, errors.New("empty domain model response")
+		return domainengine.ModelResult{Called: true}, errors.New("empty domain model response")
 	}
-	return domainengine.ModelResult{Text: resp.Content, FinishReason: resp.FinishReason, ToolAttempt: len(resp.ToolCalls) > 0,
+	return domainengine.ModelResult{Called: true, Text: resp.Content, FinishReason: resp.FinishReason, ToolAttempt: len(resp.ToolCalls) > 0,
 		PromptTokens: resp.Usage.PromptTokens, CompletionTokens: resp.Usage.CompletionTokens}, nil
 }

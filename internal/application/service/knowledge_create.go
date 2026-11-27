@@ -214,24 +214,6 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 	}
 	knowledge.FilePath = filePath
 
-	// Save knowledge record to database after the file is safely stored.
-	logger.Info(ctx, "Saving knowledge record to database")
-	if err := s.persistKnowledgeForCreation(ctx, knowledge, replacement); err != nil {
-		logger.Errorf(ctx, "Failed to create knowledge record, ID: %s, error: %v", knowledge.ID, err)
-		if replacement == nil || !replacement.keepFile {
-			if deleteErr := fileSvc.DeleteFile(context.WithoutCancel(ctx), filePath); deleteErr != nil {
-				logger.Errorf(ctx, "Failed to delete saved file after knowledge creation failed, path: %s, error: %v",
-					filePath, deleteErr)
-			}
-		}
-		return nil, err
-	}
-	// Set tag relations
-	if err := s.attachCreationTags(ctx, knowledge, tagIDs, replacement); err != nil {
-		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
-		return nil, err
-	}
-
 	// Enqueue document processing task to Asynq
 	logger.Info(ctx, "Enqueuing document processing task to Asynq")
 	enableMultimodelValue := eff.EnableMultimodel
@@ -259,26 +241,42 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 	langfuse.InjectTracing(ctx, &taskPayload)
 	payloadBytes, err := json.Marshal(taskPayload)
 	if err != nil {
-		logger.Errorf(ctx, "Failed to marshal document process task payload: %v", err)
-		s.markKnowledgeEnqueueFailed(ctx, knowledge)
-		recordKBActivity(ctx, s.audit, knowledge.TenantID, kbID, types.AuditActionKnowledgeCreated,
-			"knowledge", knowledge.ID, types.AuditOutcomeFailed, map[string]any{
-				"title": knowledge.Title, "source_type": "file", "file_type": knowledge.FileType,
-				"processing_status": "failed", "failure_stage": "enqueue",
-			})
-		// 即使入队失败，也返回knowledge，因为文件已保存
-		return knowledge, nil
+		_ = fileSvc.DeleteFile(context.WithoutCancel(ctx), filePath)
+		return nil, err
 	}
 
+	domainPrepared := false
+	domainScope := domainengine.Scope{TenantID: tenantID, KBID: kbID}
 	if s.domainStore != nil {
-		scope := domainengine.Scope{TenantID: tenantID, KBID: kbID}
-		if err := s.domainStore.Start(ctx, scope, knowledge.ID, filePath, knowledge.FileHash, DomainModels{Service: s.modelService}, payloadBytes); err != nil {
-			logger.Warnf(ctx, "could not record domain processing intent for %s", knowledge.ID)
+		domainPrepared, err = s.domainStore.PrepareUpload(ctx, domainScope, knowledge.ID, filePath, knowledge.FileHash, DomainModels{Service: s.modelService}, payloadBytes)
+		if err != nil {
+			if cleanupErr := fileSvc.DeleteFile(context.WithoutCancel(ctx), filePath); cleanupErr != nil {
+				logger.Warnf(ctx, "could not delete uncommitted upload %s", knowledge.ID)
+			}
+			return nil, fmt.Errorf("prepare domain upload: %w", err)
 		}
 	}
 
+	// Save knowledge record to database after the file is safely stored.
+	logger.Info(ctx, "Saving knowledge record to database")
+	if err := s.persistKnowledgeForCreation(ctx, knowledge, replacement); err != nil {
+		logger.Errorf(ctx, "Failed to create knowledge record, ID: %s, error: %v", knowledge.ID, err)
+		if replacement == nil || !replacement.keepFile {
+			if deleteErr := fileSvc.DeleteFile(context.WithoutCancel(ctx), filePath); deleteErr != nil {
+				logger.Errorf(ctx, "Failed to delete saved file after knowledge creation failed, path: %s, error: %v",
+					filePath, deleteErr)
+			}
+		}
+		return nil, err
+	}
+	// Set tag relations
+	if err := s.attachCreationTags(ctx, knowledge, tagIDs, replacement); err != nil {
+		logger.Errorf(ctx, "Failed to set knowledge tags, knowledge ID: %s, error: %v", knowledge.ID, err)
+		return nil, err
+	}
+
 	taskOptions := documentProcessTaskOptions(s.config, asynq.MaxRetry(3))
-	if s.domainStore != nil {
+	if domainPrepared {
 		taskOptions = append(taskOptions, asynq.TaskID(domainengine.NativeTaskID(knowledge.ID, filePath, knowledge.FileHash)))
 	}
 	task := asynq.NewTask(types.TypeDocumentProcess, payloadBytes, taskOptions...)
@@ -286,6 +284,15 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 	info, err := s.task.Enqueue(task)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue document process task: %v", err)
+		if domainPrepared {
+			repair, stop := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			defer stop()
+			if repairErr := s.domainStore.MarkUploadQueueFailure(repair, domainScope, knowledge.ID); repairErr != nil {
+				logger.Warnf(ctx, "could not record native enqueue error for %s", knowledge.ID)
+			}
+			return knowledge, nil
+		}
+
 		s.markKnowledgeEnqueueFailed(ctx, knowledge)
 		recordKBActivity(ctx, s.audit, knowledge.TenantID, kbID, types.AuditActionKnowledgeCreated,
 			"knowledge", knowledge.ID, types.AuditOutcomeFailed, map[string]any{

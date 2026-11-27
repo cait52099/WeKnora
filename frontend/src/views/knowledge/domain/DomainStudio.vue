@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { get, getDown, post, put } from '@/utils/request'
 import { listModels, type ModelConfig } from '@/api/model'
+import { dashboardQuery, failedPageJobs, moveCursor } from './dashboard'
 
 type Stage = {
   id: string
@@ -11,11 +12,14 @@ type Stage = {
   inputs: Record<string, { source: string; stage_id?: string }>
   optional?: boolean
   enabled?: boolean
+  input_tokens?: number
+  output_tokens?: number
+  timeout_seconds?: number
 }
 type Profile = { id: string; revision: string; name: string; stages: Stage[] }
 type Revision = Pick<Profile, 'id' | 'revision'>
 type Binding = { profile_id: string; revision: string; enabled: boolean; version: number }
-type Job = { id: string; document_id: string; profile_id: string; revision: string; status: string; error_code: string; stage_index: number }
+type Job = { file_name: string; title: string; current: boolean; id: string; document_id: string; profile_id: string; revision: string; status: string; error_code: string; stage_index: number }
 type Run = { attempt: number; stage_id: string; raw_available: boolean; valid_available: boolean; prompt_tokens: number; completion_tokens: number; error_code: string; reused: boolean; input_coverage?: { mode: string; completed_parts: number; parts: number } }
 
 const props = defineProps<{ kbId: string }>()
@@ -35,6 +39,16 @@ const binding = ref<Binding | null>(null)
 const selection = ref('')
 const enabled = ref(true)
 const jobs = ref<Job[]>([])
+const status = ref('')
+const search = ref('')
+const cursors = ref<string[]>([''])
+const next = ref('')
+const counts = ref<Record<string, number>>({})
+const usage = ref<Record<string, number>>({})
+const packageFile = ref<File | null>(null)
+const packagePreview = ref('')
+type Dashboard = { jobs: Job[]; next?: string; counts: Record<string, number>; usage: Record<string, number> }
+
 const current = ref<Job | null>(null)
 const runs = ref<Run[]>([])
 const artifact = ref('')
@@ -92,15 +106,52 @@ watch(() => props.kbId, async (id) => {
 async function refresh() {
   const path = endpoint.value
   const id = current.value?.id
-  const result = await get<{ data: Job[] }>(path + '/jobs')
-  if (path !== endpoint.value) return
-  jobs.value = result.data
+  const query = dashboardQuery(status.value, search.value, cursors.value)
+  const result = await get<{ data: Dashboard }>(path + '/jobs?' + query)
+  if (path !== endpoint.value || query !== dashboardQuery(status.value, search.value, cursors.value)) return
+  jobs.value = result.data.jobs
+  next.value = result.data.next || ''
+  counts.value = result.data.counts
+  usage.value = result.data.usage
   if (id && current.value?.id === id) {
     current.value = jobs.value.find(job => job.id === id) || null
     if (!current.value) { runs.value = []; artifact.value = ''; coverage.value = null; return }
     const result = await get<{ data: Run[] }>(path + '/jobs/' + id + '/runs')
     if (path === endpoint.value && current.value?.id === id) runs.value = result.data
   }
+}
+
+function changeFilter() { cursors.value = ['']; void refresh().catch(message) }
+function changePage(forward: boolean) {
+  cursors.value = moveCursor(cursors.value, forward, next.value)
+  void refresh().catch(message)
+}
+const retryable = computed(() => failedPageJobs(jobs.value))
+async function batchRetry() {
+  try {
+    const result = await post<{ data: { retried: number; failed: string[] } }>(endpoint.value + '/jobs/batch-retry', { ids: retryable.value.map(job => job.id) })
+    notice.value = `Queued ${result.data.retried} retries. ${result.data.failed.length} could not be retried.`
+    await refresh()
+  } catch (reason) { message(reason) }
+}
+async function submitPackage(action: 'preview' | 'publish') {
+  if (!packageFile.value) return
+  try {
+    const result = await post<{ data: unknown }>(root + '/package/' + action, packageFile.value, { headers: { 'Content-Type': 'application/octet-stream' } })
+    packagePreview.value = JSON.stringify(result.data, null, 2)
+    if (action === 'publish') {
+      revisions.value = (await get<{ data: Revision[] }>(root)).data
+      notice.value = 'Package published.'
+    }
+  } catch (reason) { message(reason) }
+}
+async function exportPackage() {
+  if (!selection.value) return
+  const [id, revision] = JSON.parse(selection.value)
+  try {
+    const file = await getDown(root + '/' + encodeURIComponent(id) + '/' + encodeURIComponent(revision) + '/package')
+    download(file, 'domain-profile.zip')
+  } catch (reason) { message(reason) }
 }
 
 let timer: ReturnType<typeof setInterval> | undefined
@@ -239,12 +290,25 @@ async function original() {
     <t-tabs default-value="jobs">
       <t-tab-panel value="jobs" label="Processing">
         <p>Upload a file through the knowledge base to start processing automatically when a profile is enabled.</p>
-        <t-button variant="outline" size="small" @click="refresh().catch(message)">Refresh</t-button>
+        <div class="domain-actions">
+          <label>Search file or title <input v-model="search" maxlength="300" @change="changeFilter"></label>
+          <label>Status <select v-model="status" @change="changeFilter"><option value="">All</option>
+            <option v-for="(_, key) in counts" :key="key" :value="key">{{ key }}</option></select></label>
+          <t-button variant="outline" size="small" @click="refresh().catch(message)">Refresh</t-button>
+          <t-button variant="outline" size="small" :disabled="!retryable.length" @click="batchRetry">Retry failures on this page</t-button>
+        </div>
+        <p aria-label="Knowledge base job totals"><span v-for="(count, key) in counts" :key="key">{{ key }}: {{ count }} · </span></p>
+        <p v-if="Object.keys(usage).length">Reported tokens {{ usage.prompt_tokens }} input / {{ usage.completion_tokens }} output · {{ usage.model_calls }} tracked calls · {{ usage.unknown_calls }} without usage · {{ usage.reused_runs }} reused · {{ usage.legacy_runs }} legacy runs</p>
         <div v-if="!jobs.length" class="domain-empty">No processing jobs for this knowledge base.</div>
         <div v-for="job in jobs" :key="job.id" class="domain-job">
-          <t-button variant="text" @click="openJob(job)">{{ job.document_id }}</t-button>
-          <span>{{ job.status }} · {{ job.profile_id }} {{ job.revision }}</span>
+          <t-button variant="text" @click="openJob(job)">{{ job.title || job.file_name || job.document_id }}</t-button>
+          <span v-if="job.file_name && job.file_name !== job.title">{{ job.file_name }}</span>
+          <span>{{ job.status }} · {{ job.profile_id }} {{ job.revision }} · {{ job.current ? 'current binding' : 'history' }}</span>
           <span v-if="job.error_code" class="domain-error">{{ job.error_code }}</span>
+        </div>
+        <div class="domain-actions">
+          <t-button size="small" :disabled="cursors.length < 2" @click="changePage(false)">Previous</t-button>
+          <t-button size="small" :disabled="!next" @click="changePage(true)">Next</t-button>
         </div>
         <section v-if="current" class="domain-detail">
           <div class="domain-actions">
@@ -290,6 +354,13 @@ async function original() {
           <label>Import JSON manifest <input type="file" accept=".json" @change="importFile($event, 'manifest')"></label>
           <t-button size="small" variant="outline" :disabled="!editor" @click="exportManifest">Export draft</t-button>
         </div>
+        <div class="domain-actions">
+          <label>Complete profile ZIP <input type="file" accept=".zip" @change="packageFile = ($event.target as HTMLInputElement).files?.[0] || null; packagePreview = ''"></label>
+          <t-button size="small" :disabled="!packageFile" @click="submitPackage('preview')">Preview package</t-button>
+          <t-button size="small" :disabled="!packagePreview" @click="submitPackage('publish')">Publish package</t-button>
+          <t-button size="small" :disabled="!selection" @click="exportPackage">Download published package</t-button>
+        </div>
+        <pre v-if="packagePreview">{{ packagePreview }}</pre>
         <details v-if="stage" class="domain-detail">
           <summary>Stage editor</summary>
           <div class="domain-actions">
@@ -301,6 +372,12 @@ async function original() {
               </select>
             </label>
             <label v-if="stage.optional"><input type="checkbox" :checked="stage.enabled" @change="editStage({ enabled: ($event.target as HTMLInputElement).checked })"> Run optional stage</label>
+          </div>
+          <div class="domain-actions">
+            <label>Input tokens <input type="number" min="0" :value="stage.input_tokens || 0" @change="editStage({ input_tokens: Number(($event.target as HTMLInputElement).value) })"></label>
+            <label>Output tokens <input type="number" min="0" :value="stage.output_tokens || 0" @change="editStage({ output_tokens: Number(($event.target as HTMLInputElement).value) })"></label>
+            <label>Timeout seconds <input type="number" min="0" max="1800" :value="stage.timeout_seconds || 0" @change="editStage({ timeout_seconds: Number(($event.target as HTMLInputElement).value) })"></label>
+            <span>0 uses defaults</span>
           </div>
           <label>Prompt <textarea :value="stage.prompt" rows="4" @change="editStage({ prompt: ($event.target as HTMLTextAreaElement).value })" /></label>
           <label>Import TXT or DOCX prompt <input type="file" accept=".txt,.docx" @change="importFile($event, 'prompt')"></label>

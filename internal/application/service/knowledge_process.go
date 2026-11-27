@@ -21,6 +21,7 @@ import (
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/common"
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -3346,14 +3347,32 @@ func (s *knowledgeService) reparseKnowledge(
 			return existing, werrors.NewInternalServerError("Failed to submit processing task")
 		}
 
-		task := asynq.NewTask(
-			types.TypeDocumentProcess,
-			payloadBytes,
-			documentProcessTaskOptions(s.config, asynq.MaxRetry(3))...,
-		)
+		options := documentProcessTaskOptions(s.config, asynq.MaxRetry(3))
+		var intent bool
+		scope := domainengine.Scope{TenantID: tenantID, KBID: existing.KnowledgeBaseID}
+		if s.domainStore != nil && existing.Type == "file" && existing.FileHash != "" {
+			intent, err = s.domainStore.PrepareReparse(ctx, scope, existing.ID, existing.FilePath, existing.FileHash, DomainModels{Service: s.modelService}, payloadBytes)
+			if err != nil {
+				s.markKnowledgeEnqueueFailed(ctx, existing)
+				return existing, werrors.NewInternalServerError("Failed to prepare domain processing intent")
+			}
+			if intent {
+				options = append(options, asynq.TaskID(domainengine.NativeTaskID(existing.ID, existing.FilePath, existing.FileHash)))
+			}
+		}
+		task := asynq.NewTask(types.TypeDocumentProcess, payloadBytes, options...)
+
 		info, err := s.task.Enqueue(task)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to enqueue reparse task: %v", err)
+			if intent {
+				repair, stop := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+				defer stop()
+				_ = s.domainStore.MarkUploadQueueFailure(repair, scope, existing.ID)
+				recordReparseStarted()
+				return existing, nil
+			}
+
 			s.markKnowledgeEnqueueFailed(ctx, existing)
 			return existing, werrors.NewInternalServerError("Failed to submit processing task")
 		}

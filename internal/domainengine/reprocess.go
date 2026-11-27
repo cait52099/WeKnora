@@ -16,21 +16,20 @@ func (s *Store) Reprocess(ctx context.Context, scope Scope, id string, models Mo
 	if !old.ParseAttempt.Valid || old.Status == "running" || old.Status == "waiting_parse" {
 		return ErrConflict
 	}
-	binding, err := s.ActiveBinding(ctx, scope)
+	intent, err := s.prepare(ctx, scope, models, "preparing")
 	if err != nil {
 		return err
 	}
-	if binding == nil || binding.Version == old.BindingVersion {
+	if intent == nil || intent.status != "preparing" || intent.binding.Version == old.BindingVersion {
 		return ErrConflict
 	}
+	binding := intent.binding
 	var path, hash string
 	err = s.db.QueryRowContext(ctx, `SELECT source_path,native_hash FROM domain_engine.jobs WHERE id=$1`, old.ID).Scan(&path, &hash)
 	if err != nil {
 		return err
 	}
-	if err = s.start(ctx, scope, old.DocumentID, path, hash, models, "preparing"); err != nil {
-		return err
-	}
+
 	from, err := s.LoadProfile(ctx, scope.TenantID, old.ProfileID, old.Revision)
 	if err != nil {
 		return err
@@ -52,6 +51,24 @@ func (s *Store) Reprocess(ctx context.Context, scope Scope, id string, models Mo
 		return err
 	}
 	defer tx.Rollback()
+	created, err := intent.insert(ctx, tx, old.DocumentID, path, hash, nil)
+	if err != nil {
+		return err
+	}
+	if !created {
+		var exists bool
+		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM domain_engine.jobs j`+liveJob+`
+			WHERE j.tenant_id=$1 AND j.kb_id=$2 AND j.document_id=$3 AND j.source_path=$4 AND j.binding_version=$5
+			AND j.status<>'preparing')`, scope.TenantID, scope.KBID, old.DocumentID, path, binding.Version).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		return ErrConflict
+	}
+
 	var newID string
 	var oldPins, newPins []byte
 	var snapshotVersion int64
@@ -61,8 +78,11 @@ func (s *Store) Reprocess(ctx context.Context, scope Scope, id string, models Mo
 		AND next.source_path=old.source_path AND next.native_hash=old.native_hash
 		JOIN domain_engine.kb_bindings b ON b.tenant_id=next.tenant_id AND b.kb_id=next.kb_id
 		 AND b.version=next.binding_version AND b.access_epoch=next.access_epoch AND b.access_epoch=old.access_epoch AND b.enabled
+		JOIN knowledges k ON k.id=next.document_id AND k.tenant_id=next.tenant_id AND k.knowledge_base_id=next.kb_id
+		 AND k.file_path=next.source_path AND k.file_hash=next.native_hash AND k.deleted_at IS NULL
+		JOIN knowledge_bases kb ON kb.id=next.kb_id AND kb.tenant_id=next.tenant_id AND kb.deleted_at IS NULL
 		WHERE old.id=$1 AND next.binding_version=$2 AND next.status='preparing'
-		FOR UPDATE OF next`, old.ID, binding.Version).Scan(&newID, &oldPins, &newPins, &snapshotVersion)
+		FOR UPDATE OF next,b,k,kb`, old.ID, binding.Version).Scan(&newID, &oldPins, &newPins, &snapshotVersion)
 	if err != nil {
 		return err
 	}

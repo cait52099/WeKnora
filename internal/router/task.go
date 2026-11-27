@@ -236,7 +236,11 @@ func NewDomainAsynqServer(worker *domainengine.Worker) *asynq.Server {
 	if worker == nil {
 		return nil
 	}
-	return newAsynqServer(2, map[string]int{domainengine.Queue: 1})
+	limit, _ := strconv.Atoi(os.Getenv("DOMAIN_WORKER_CONCURRENCY"))
+	if limit <= 0 {
+		limit = 2
+	}
+	return newAsynqServer(min(limit, 16), map[string]int{domainengine.Queue: 1})
 }
 
 func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {

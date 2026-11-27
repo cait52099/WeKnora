@@ -1,6 +1,7 @@
 package domainengine
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"database/sql"
@@ -35,6 +36,7 @@ func (m *recordingModels) Generate(_ context.Context, _ uint64, _ string, _ Mode
 	}
 	r := m.responses[0]
 	m.responses = m.responses[1:]
+	r.Called = true
 	return r, nil
 }
 
@@ -54,6 +56,20 @@ func (q *trackingQueue) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.
 	info, err := q.client.Enqueue(task, opts...)
 	q.info = info
 	return info, err
+}
+
+type bindingRaceModel struct {
+	*recordingModels
+	onPin func()
+}
+
+func (m *bindingRaceModel) Pin(ctx context.Context, tenant uint64, id string) (ModelPin, error) {
+	if m.onPin != nil {
+		run := m.onPin
+		m.onPin = nil
+		run()
+	}
+	return m.recordingModels.Pin(ctx, tenant, id)
 }
 
 func TestPostgresDomainWorker(t *testing.T) {
@@ -77,12 +93,12 @@ func TestPostgresDomainWorker(t *testing.T) {
 	}
 	exec(`CREATE TABLE tenants (id bigint PRIMARY KEY,deleted_at timestamptz);
 	CREATE TABLE knowledge_bases (id text PRIMARY KEY,tenant_id bigint,deleted_at timestamptz);
-	CREATE TABLE knowledges (id text PRIMARY KEY,tenant_id bigint,knowledge_base_id text,file_path text,file_hash text,parse_status text,deleted_at timestamptz);
+	CREATE TABLE knowledges (id text PRIMARY KEY,tenant_id bigint,knowledge_base_id text,file_path text,file_hash text,parse_status text,deleted_at timestamptz,file_name text,title text);
 	CREATE TABLE knowledge_processing_spans (knowledge_id text,attempt integer);
 	INSERT INTO tenants VALUES (1,NULL),(2,NULL);
 	INSERT INTO knowledge_bases VALUES ('cosmetic',1,NULL),('automotive',1,NULL),('foreign',2,NULL);`)
 	defer exec("DROP TABLE knowledge_processing_spans,knowledges,knowledge_bases,tenants")
-	for _, migration := range []string{"000138_domain_engine", "000139_domain_jobs"} {
+	for _, migration := range []string{"000138_domain_engine", "000139_domain_jobs", "000140_domain_hardening"} {
 		up, err := os.ReadFile("../../migrations/versioned/" + migration + ".up.sql")
 		must(t, err)
 		down, err := os.ReadFile("../../migrations/versioned/" + migration + ".down.sql")
@@ -101,19 +117,47 @@ func TestPostgresDomainWorker(t *testing.T) {
 			original := []byte("ORIGINAL_SENTINEL")
 			md := md5.Sum(original)
 			hash := hex.EncodeToString(md[:])
-			exec("INSERT INTO knowledges VALUES($1,1,$2,'source',$3,'processing',NULL)", doc, tc.name, hash)
-			exec("INSERT INTO knowledge_processing_spans VALUES($1,1)", doc)
+			eligible, err := store.PrepareUpload(ctx, Scope{TenantID: 2, KBID: "foreign"}, "ordinary", "path", hash, &recordingModels{}, nil)
+			must(t, err)
+			if eligible {
+				t.Fatal("unbound file received a domain intent")
+			}
+
 			p := fixture(t, tc.name)
 			must(t, store.Publish(ctx, 1, p))
 			b := Binding{Scope: scope, Enabled: true, ProfileID: p.profile.ID, Revision: p.profile.Revision}
-			_, err := store.Bind(ctx, b, 0)
+			_, err = store.Bind(ctx, b, 0)
 			must(t, err)
 			model := &recordingModels{responses: []ModelResult{
 				{Text: tc.extract, PromptTokens: 10, CompletionTokens: 2},
 				{Text: "invalid", PromptTokens: 12, CompletionTokens: 1},
 				{Text: tc.semantic, PromptTokens: 12, CompletionTokens: 3},
 			}}
-			must(t, store.Start(ctx, scope, doc, "source", hash, model))
+			prepared, err := store.PrepareUpload(ctx, scope, doc, "source", hash, model, []byte(`{"mock":"native task"}`))
+			must(t, err)
+			if !prepared {
+				t.Fatal("missing precommitted upload")
+			}
+			// Simulate process loss before native creation, then reopen the
+			// store and finish native creation without a second submission.
+			store = NewStore(db)
+			pending, err := store.ListJobs(ctx, scope)
+			must(t, err)
+			if len(pending) != 0 {
+				t.Fatal("uncommitted native file was visible")
+			}
+			exec("INSERT INTO knowledges VALUES($1,1,$2,'source',$3,'processing',NULL)", doc, tc.name, hash)
+			exec("INSERT INTO knowledge_processing_spans VALUES($1,1)", doc)
+
+			exec("UPDATE knowledges SET parse_status='pending' WHERE id=$1", doc)
+			must(t, store.MarkUploadQueueFailure(ctx, scope, doc))
+			native := new(losingQueue)
+			if err := (&Worker{Store: NewStore(db), Models: model}).Dispatch(ctx, native); err == nil || len(native.ids) != 1 ||
+				native.ids[0] != `{"mock":"native task"}` {
+				t.Fatalf("native lost wake not recovered: %+v %v", native.ids, err)
+			}
+			exec("UPDATE knowledges SET parse_status='processing' WHERE id=$1", doc)
+
 			binding, id, err := store.CaptureBinding(ctx, scope, doc, "source", hash)
 			must(t, err)
 			if binding == nil || id == "" {
@@ -196,6 +240,19 @@ func TestPostgresDomainWorker(t *testing.T) {
 			if _, err = store.GetJob(ctx, Scope{TenantID: 2, KBID: scope.KBID}, id); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("tenant boundary: %v", err)
 			}
+			exec(`CREATE FUNCTION domain_engine.fail_preparing() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN IF OLD.status='preparing' THEN RAISE EXCEPTION 'synthetic transition failure'; END IF; RETURN NEW; END; $$;
+				CREATE TRIGGER fail_preparing BEFORE UPDATE ON domain_engine.jobs FOR EACH ROW EXECUTE FUNCTION domain_engine.fail_preparing();`)
+			if err := store.Reprocess(ctx, scope, id, model); err == nil {
+				t.Fatal("fault injection did not abort")
+			}
+			var partial int
+			must(t, db.QueryRowContext(ctx, `SELECT count(*) FROM domain_engine.jobs WHERE status='preparing'`).Scan(&partial))
+			if partial != 0 {
+				t.Fatal("crash left a preparing job")
+			}
+			exec("DROP TRIGGER fail_preparing ON domain_engine.jobs; DROP FUNCTION domain_engine.fail_preparing()")
+			must(t, store.Reprocess(ctx, scope, id, model))
 			must(t, store.Reprocess(ctx, scope, id, model))
 			jobs, err := store.ListJobs(ctx, scope)
 			must(t, err)
@@ -235,6 +292,21 @@ func TestPostgresDomainWorker(t *testing.T) {
 			if cancelled.Status != "cancelled" || len(cancelledRuns) != 1 || !cancelledRuns[0].Reused {
 				t.Fatalf("late result escaped cancellation: %+v %+v", cancelled, cancelledRuns)
 			}
+			b.Version = 4
+			_, err = store.Bind(ctx, b, 3)
+			must(t, err)
+			racer := &bindingRaceModel{recordingModels: model, onPin: func() {
+				_, err := store.Bind(ctx, b, 4)
+				must(t, err)
+			}}
+			if err = store.Reprocess(ctx, scope, id, racer); err == nil {
+				t.Fatal("superseded binding was accepted")
+			}
+			must(t, db.QueryRowContext(ctx, `SELECT count(*) FROM domain_engine.jobs WHERE status='preparing'`).Scan(&partial))
+			if partial != 0 {
+				t.Fatal("binding change left a preparing job")
+			}
+
 			if tc.name == "cosmetic" {
 				exec(`CREATE FUNCTION domain_engine.fixture_fail_cleanup() RETURNS trigger LANGUAGE plpgsql
 					AS $$ BEGIN RAISE EXCEPTION 'synthetic cleanup failure'; END; $$;
@@ -262,6 +334,70 @@ func TestPostgresDomainWorker(t *testing.T) {
 			}
 		})
 	}
+	t.Run("package round trip", func(t *testing.T) {
+		raw, _ := syntheticPackage(t)
+		bundle, err := ImportPackage(raw)
+		must(t, err)
+		store := NewStore(db)
+		must(t, store.PublishPackage(ctx, 1, bundle))
+		got, err := store.ExportPackage(ctx, 1, bundle.Profile.profile.ID, bundle.Profile.profile.Revision)
+		must(t, err)
+		if !bytes.Equal(got, raw) {
+			t.Fatal("package originals were changed")
+		}
+		if _, err := store.ExportPackage(ctx, 2, bundle.Profile.profile.ID, bundle.Profile.profile.Revision); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("archive escaped tenant: %v", err)
+		}
+	})
+
+	t.Run("dashboard810", func(t *testing.T) {
+		store := NewStore(db)
+		scope := Scope{TenantID: 1, KBID: "automotive"}
+		exec(`INSERT INTO knowledges(id,tenant_id,knowledge_base_id,file_path,file_hash,parse_status,file_name,title)
+			SELECT 'batch-'||i,1,'automotive','path-'||i,'hash','completed',
+			CASE WHEN i%2=0 THEN 'brakes-'||i ELSE 'paint-'||i END,'Report '||i
+			FROM generate_series(1,810) i;
+			INSERT INTO domain_engine.jobs(tenant_id,kb_id,document_id,source_path,native_hash,profile_id,revision,
+			binding_version,access_epoch,model_pins,optional_stages,status,created_at)
+			SELECT 1,'automotive',k.id,k.file_path,k.file_hash,b.profile_id,b.revision,b.version,b.access_epoch,'{}','{}',
+			CASE WHEN k.file_name LIKE 'brakes-%' THEN 'failed' ELSE 'succeeded' END, TIMESTAMP '2026-01-01'
+			FROM knowledges k JOIN domain_engine.kb_bindings b ON b.kb_id=k.knowledge_base_id WHERE k.id LIKE 'batch-%';
+			INSERT INTO domain_engine.stage_runs(job_id,fence,stage_index,stage_id,prompt_tokens,completion_tokens,error_code,model_calls,reported_calls)
+			SELECT id,1,0,'extract',2,3,'',2,1 FROM domain_engine.jobs WHERE document_id LIKE 'batch-%';`)
+		seen := map[string]bool{}
+		cursor := ""
+		for {
+			page, err := store.Dashboard(ctx, scope, "", "", cursor, 50)
+			must(t, err)
+			if page.Counts["failed"] != 405 || page.Counts["succeeded"] != 405 || page.Usage.PromptTokens != 1620 || page.Usage.UnknownCalls != 810 {
+				t.Fatalf("bad totals: %+v %+v", page.Counts, page.Usage)
+			}
+			for _, job := range page.Jobs {
+				if seen[job.ID] || job.Title == "" || job.FileName == "" || !job.Current {
+					t.Fatal("bad page")
+				}
+				seen[job.ID] = true
+			}
+			if page.Next == "" {
+				break
+			}
+			cursor = page.Next
+		}
+		if len(seen) != 810 {
+			t.Fatalf("got %d", len(seen))
+		}
+		filtered, err := store.Dashboard(ctx, scope, "failed", "BRAKES", "", 100)
+		must(t, err)
+		if len(filtered.Jobs) != 100 || filtered.Next == "" || filtered.Counts["succeeded"] != 405 {
+			t.Fatal("bad search")
+		}
+		for _, job := range filtered.Jobs {
+			if !strings.HasPrefix(job.FileName, "brakes-") || job.Status != "failed" {
+				t.Fatal("incorrect search result")
+			}
+		}
+	})
+
 }
 
 func TestCompleteInputCannotBeSilentlyShortened(t *testing.T) {
@@ -286,8 +422,12 @@ func TestPartitionProcessesEveryByteAndMergesInOrder(t *testing.T) {
 		{Text: `{"vehicle_platforms":[{"platform_code":"B","cycle_count":1}]}`, PromptTokens: 3},
 	}}
 	w := &Worker{Models: m}
-	source := strings.Repeat("A", 1000) + "\n\n" + strings.Repeat("B", 1000)
-	out := w.execute(context.Background(), 1, p, p.profile.Stages[0], ModelPin{InputBudget: 2400, OutputBudget: 100}, map[string]string{"source": source}, 0, nil)
+	paragraph := strings.Repeat("抗氧化 ", 520)
+	source := paragraph + "A\n\n" + paragraph + "B"
+	one, _ := json.Marshal(map[string]string{"source": paragraph + "A\n\n"})
+	estimate, _ := estimateInput(one, string(p.profile.Stages[0].Schema)+p.profile.Stages[0].Prompt)
+	budget := estimate + 350
+	out := w.execute(context.Background(), 1, p, p.profile.Stages[0], ModelPin{InputBudget: budget, OutputBudget: 100}, map[string]string{"source": source}, 0, nil)
 	if out.valid == nil || out.coverage.CompletedParts != 2 || out.coverage.CompletedBytes != len(source) || out.result.PromptTokens != 5 {
 		t.Fatalf("partition result: %+v", out)
 	}
@@ -307,7 +447,7 @@ func TestPartitionProcessesEveryByteAndMergesInOrder(t *testing.T) {
 	guarded := &recordingModels{responses: []ModelResult{{Text: `{"vehicle_platforms":[]}`}}}
 	w.Models = guarded
 	checks := 0
-	revoked := w.execute(context.Background(), 1, p, p.profile.Stages[0], ModelPin{InputBudget: 2400, OutputBudget: 100},
+	revoked := w.execute(context.Background(), 1, p, p.profile.Stages[0], ModelPin{InputBudget: budget, OutputBudget: 100},
 		map[string]string{"source": source}, 0, func(context.Context) (bool, error) { checks++; return checks == 1, nil })
 	if len(guarded.calls) != 1 || revoked.state != "cancelled" || revoked.valid != nil {
 		t.Fatal("revoked partition reached the model")

@@ -22,7 +22,8 @@ func registerDomainRoutes(r *gin.RouterGroup, g *rbacGuards, w *domainengine.Wor
 	}
 	store := w.Store
 	session := func(c *gin.Context) {
-		if _, key := types.AuditAPIKeyFromContext(c.Request.Context()); key || types.CallerFromContext(c.Request.Context()).UserID == "" {
+		_, scopedKey := types.TenantAPIKeyScopeFromContext(c.Request.Context())
+		if _, key := types.AuditAPIKeyFromContext(c.Request.Context()); key || scopedKey || types.CallerFromContext(c.Request.Context()).UserID == "" {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
@@ -58,6 +59,35 @@ func registerDomainRoutes(r *gin.RouterGroup, g *rbacGuards, w *domainengine.Wor
 		c.Header("Cache-Control", "no-store")
 		c.Data(200, "application/json", p.Manifest())
 	})
+	for _, action := range []string{"preview", "publish"} {
+		profiles.POST("/package/"+action, func(c *gin.Context) {
+			raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, domainengine.MaxPackageBytes))
+			if err != nil {
+				c.Status(400)
+				return
+			}
+			bundle, err := domainengine.ImportPackage(raw)
+			if err != nil {
+				c.JSON(400, gin.H{"message": err.Error()})
+				return
+			}
+			if action == "publish" {
+				err = store.PublishPackage(c.Request.Context(), tenant(c), bundle)
+			}
+			reply(c, bundle, err)
+		})
+	}
+	profiles.GET("/:profile/:revision/package", func(c *gin.Context) {
+		raw, err := store.ExportPackage(c.Request.Context(), tenant(c), c.Param("profile"), c.Param("revision"))
+		if err != nil {
+			reply(c, nil, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Content-Disposition", `attachment; filename="domain-profile.zip"`)
+		c.Data(200, "application/zip", raw)
+	})
+
 	for _, action := range []string{"validate", "publish"} {
 		profiles.POST("/"+action, func(c *gin.Context) {
 			raw, err := payload(c)
@@ -134,7 +164,11 @@ func registerDomainRoutes(r *gin.RouterGroup, g *rbacGuards, w *domainengine.Wor
 				if stage.Optional && !stage.Enabled {
 					continue
 				}
-				if _, err = w.Models.Pin(c.Request.Context(), tenant(c), stage.ModelRef); err != nil {
+				pin, pinErr := w.Models.Pin(c.Request.Context(), tenant(c), stage.ModelRef)
+				if pinErr == nil {
+					_, pinErr = pin.ForStage(stage)
+				}
+				if pinErr != nil {
 					c.JSON(400, gin.H{"message": "Each enabled stage requires an available chat model", "stage_id": stage.ID})
 					return
 				}
@@ -143,7 +177,22 @@ func registerDomainRoutes(r *gin.RouterGroup, g *rbacGuards, w *domainengine.Wor
 		version, err := store.Bind(c.Request.Context(), domainengine.Binding{Scope: scope(c), ProfileID: body.Profile, Revision: body.Revision, Enabled: body.Enabled}, body.Version)
 		reply(c, gin.H{"version": version}, err)
 	})
-	group.GET("/jobs", func(c *gin.Context) { jobs, err := store.ListJobs(c.Request.Context(), scope(c)); reply(c, jobs, err) })
+	group.GET("/jobs", func(c *gin.Context) {
+		before := c.Query("before")
+		if before != "" {
+			if _, err := uuid.Parse(before); err != nil {
+				c.Status(400)
+				return
+			}
+		}
+		limit, err := strconv.Atoi(c.DefaultQuery("limit", "50"))
+		if err != nil || len(c.Query("search")) > 300 || len(c.Query("status")) > 40 {
+			c.Status(400)
+			return
+		}
+		page, err := store.Dashboard(c.Request.Context(), scope(c), c.Query("status"), c.Query("search"), before, limit)
+		reply(c, page, err)
+	})
 	jobRoutes := group.Group("/jobs/:job", func(c *gin.Context) {
 		if _, err := uuid.Parse(c.Param("job")); err != nil {
 			c.AbortWithStatus(404)
@@ -185,20 +234,37 @@ func registerDomainRoutes(r *gin.RouterGroup, g *rbacGuards, w *domainengine.Wor
 		}
 		c.Data(200, "text/plain; charset=utf-8", raw)
 	})
-	jobRoutes.POST("/retry", func(c *gin.Context) {
+	retry := func(c *gin.Context, id string) error {
 		ctx := c.Request.Context()
-		job, err := store.GetJob(ctx, scope(c), c.Param("job"))
+		job, err := store.GetJob(ctx, scope(c), id)
 		if err != nil {
-			reply(c, nil, err)
-			return
+			return err
 		}
 		if job.Status == "capture_failed" {
 			_, err = knowledge.ReparseKnowledge(ctx, job.DocumentID, nil)
-		} else {
-			err = store.ChangeJob(ctx, scope(c), job.ID, false)
+			return err
 		}
-		reply(c, nil, err)
+		return store.ChangeJob(ctx, scope(c), job.ID, false)
+	}
+	jobRoutes.POST("/retry", func(c *gin.Context) { reply(c, nil, retry(c, c.Param("job"))) })
+	group.POST("/jobs/batch-retry", func(c *gin.Context) {
+		var selection struct {
+			IDs []string `json:"ids"`
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8192)
+		if c.ShouldBindJSON(&selection) != nil || len(selection.IDs) < 1 || len(selection.IDs) > 50 {
+			c.Status(400)
+			return
+		}
+		failed := make([]string, 0)
+		for _, id := range selection.IDs {
+			if _, err := uuid.Parse(id); err != nil || retry(c, id) != nil {
+				failed = append(failed, id)
+			}
+		}
+		reply(c, gin.H{"failed": failed, "retried": len(selection.IDs) - len(failed)}, nil)
 	})
+
 	jobRoutes.POST("/reprocess", func(c *gin.Context) {
 		reply(c, nil, store.Reprocess(c.Request.Context(), scope(c), c.Param("job"), w.Models))
 	})

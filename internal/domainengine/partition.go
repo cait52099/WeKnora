@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/tiktoken-go/tokenizer"
 	"strings"
+	"sync"
 )
 
 // ArrayPartition is an explicit profile opt-in. Each contiguous document
@@ -15,11 +17,14 @@ type ArrayPartition struct {
 	MaxParts int    `json:"max_parts"`
 }
 type StageCoverage struct {
-	Mode           string `json:"mode"`
-	TotalBytes     int    `json:"total_bytes"`
-	CompletedBytes int    `json:"completed_bytes"`
-	Parts          int    `json:"parts"`
-	CompletedParts int    `json:"completed_parts"`
+	EstimatedTokens int    `json:"estimated_input_tokens,omitempty"`
+	BudgetTokens    int    `json:"input_budget_tokens,omitempty"`
+	Estimator       string `json:"estimator,omitempty"`
+	Mode            string `json:"mode"`
+	TotalBytes      int    `json:"total_bytes"`
+	CompletedBytes  int    `json:"completed_bytes"`
+	Parts           int    `json:"parts"`
+	CompletedParts  int    `json:"completed_parts"`
 }
 
 func validatePartition(stage StageDefinition) error {
@@ -38,8 +43,22 @@ func validatePartition(stage StageDefinition) error {
 	return nil
 }
 
+var budgetCodec = sync.OnceValues(func() (tokenizer.Codec, error) { return tokenizer.Get(tokenizer.Cl100kBase) })
+
+func estimateInput(body []byte, system string) (int, string) {
+	codec, err := budgetCodec()
+	if err == nil {
+		a, _, errA := codec.Encode(system)
+		b, _, errB := codec.Encode(string(body))
+		if errA == nil && errB == nil {
+			return ((len(a)+len(b))*5+3)/4 + 128, "cl100k_base_plus_25_percent"
+		}
+	}
+	return len(body) + len(system) + 256, "utf8_upper_bound_fallback"
+}
 func fitsInput(body []byte, system string, pin ModelPin) bool {
-	return len(body)+len(system)+256 <= pin.InputBudget
+	n, _ := estimateInput(body, system)
+	return n <= pin.InputBudget
 }
 
 // documentParts preserves every byte, including paragraph separators.
@@ -85,30 +104,33 @@ func (w *Worker) executePartition(ctx context.Context, tenant uint64, p *Compile
 	rawResponses := make([]string, 0, len(parts))
 	merged := make([]json.RawMessage, 0)
 	total := ModelResult{}
-	var size int
+	var size, calls, reported int
 	for _, part := range parts {
 		body, _ := json.Marshal(map[string]string{key: part})
 		validated := w.callModel(ctx, tenant, p, stage, pin, instructions, body, map[string]string{key: part}, retries, authorize)
+		calls += validated.modelCalls
+		reported += validated.reportedCalls
 		total.PromptTokens += validated.result.PromptTokens
 		total.CompletionTokens += validated.result.CompletionTokens
 		rawResponses = append(rawResponses, validated.result.Text)
 		size += len(validated.result.Text)
 		if size > maxResultBytes/2 {
-			return stageOutcome{state: "needs_review", code: "partition_output_exceeds_limit", result: total, coverage: coverage}
+			return stageOutcome{state: "needs_review", code: "partition_output_exceeds_limit", result: total, coverage: coverage, modelCalls: calls, reportedCalls: reported}
 		}
 		raw, _ := json.Marshal(rawResponses)
 		total.Text = string(raw)
 		if validated.valid == nil {
 			validated.result, validated.coverage = total, coverage
+			validated.modelCalls, validated.reportedCalls = calls, reported
 			return validated
 		}
 		var object map[string]json.RawMessage
 		if err := json.Unmarshal(validated.valid, &object); err != nil || len(object) != 1 || len(object[spec.ArrayKey]) == 0 || object[spec.ArrayKey][0] != '[' {
-			return stageOutcome{state: "needs_review", code: "partition_result_contract", result: total, coverage: coverage}
+			return stageOutcome{state: "needs_review", code: "partition_result_contract", result: total, coverage: coverage, modelCalls: calls, reportedCalls: reported}
 		}
 		var records []json.RawMessage
 		if err := json.Unmarshal(object[spec.ArrayKey], &records); err != nil {
-			return stageOutcome{state: "needs_review", code: "partition_result_contract", result: total, coverage: coverage}
+			return stageOutcome{state: "needs_review", code: "partition_result_contract", result: total, coverage: coverage, modelCalls: calls, reportedCalls: reported}
 		}
 		merged = append(merged, records...)
 		coverage.CompletedParts++
@@ -116,7 +138,7 @@ func (w *Worker) executePartition(ctx context.Context, tenant uint64, p *Compile
 	}
 	valid, err := json.Marshal(map[string][]json.RawMessage{spec.ArrayKey: merged})
 	if err != nil || p.ValidateOutput(stage.ID, valid) != nil {
-		return stageOutcome{state: "needs_review", code: "merged_output_invalid", result: total, coverage: coverage}
+		return stageOutcome{state: "needs_review", code: "merged_output_invalid", result: total, coverage: coverage, modelCalls: calls, reportedCalls: reported}
 	}
-	return stageOutcome{state: "queued", result: total, valid: valid, coverage: coverage}
+	return stageOutcome{state: "queued", result: total, valid: valid, coverage: coverage, modelCalls: calls, reportedCalls: reported}
 }
