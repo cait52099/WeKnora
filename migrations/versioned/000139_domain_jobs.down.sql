@@ -1,0 +1,10 @@
+DROP TRIGGER domain_purge_tenant ON tenants;
+DROP TRIGGER domain_purge_kb ON knowledge_bases;
+DROP TRIGGER domain_purge_document ON knowledges;
+DROP TRIGGER domain_binding_epoch ON domain_engine.kb_bindings;
+DROP FUNCTION domain_engine.purge_native_scope();
+DROP FUNCTION domain_engine.purge_native_document();
+DROP FUNCTION domain_engine.binding_epoch();
+DROP TABLE domain_engine.stage_runs;
+DROP TABLE domain_engine.jobs;
+ALTER TABLE domain_engine.kb_bindings DROP COLUMN access_epoch;

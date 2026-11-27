@@ -34,7 +34,7 @@ func (s *knowledgeService) beginDomainCapture(ctx context.Context, payload types
 	scope := domainengine.Scope{TenantID: knowledge.TenantID, KBID: knowledge.KnowledgeBaseID}
 	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	binding, err := s.domainStore.ActiveBinding(lookupCtx, scope)
+	binding, jobID, err := s.domainStore.CaptureBinding(lookupCtx, scope, knowledge.ID, knowledge.FilePath, knowledge.FileHash)
 	if err != nil {
 		logger.Warnf(ctx, "domain capture binding lookup failed for %s", knowledge.ID)
 		return ctx, nil
@@ -43,7 +43,7 @@ func (s *knowledgeService) beginDomainCapture(ctx context.Context, payload types
 		return ctx, nil
 	}
 	capture := &domainengine.ParseSnapshot{
-		Binding: *binding, DocumentID: knowledge.ID, Attempt: attempt,
+		JobID: jobID, Binding: *binding, DocumentID: knowledge.ID, Attempt: attempt,
 		FilePath: knowledge.FilePath, NativeFileHash: knowledge.FileHash,
 	}
 	return context.WithValue(ctx, domainCaptureKey{}, capture), capture
@@ -68,6 +68,7 @@ func (s *knowledgeService) finishDomainCapture(ctx context.Context, capture *dom
 	parsed string, blocks []types.SourceBlock, result *types.ReadResult, images []docparser.StoredImage,
 ) {
 	if len(capture.Original) == 0 || result == nil {
+		s.markDomainCaptureFailed(ctx, capture.JobID)
 		logger.Warnf(ctx, "domain capture unavailable for %s: missing or oversized input", capture.DocumentID)
 		return
 	}
@@ -81,6 +82,7 @@ func (s *knowledgeService) finishDomainCapture(ctx context.Context, capture *dom
 		case errors.Is(err, domainengine.ErrConflict):
 			logger.Warnf(ctx, "domain capture conflicts with existing attempt for %s", capture.DocumentID)
 		default:
+			s.markDomainCaptureFailed(ctx, capture.JobID)
 			logger.Warnf(ctx, "domain capture could not persist for %s", capture.DocumentID)
 		}
 	}
@@ -181,4 +183,10 @@ func domainBodyText(node ast.Node) bool {
 		}
 	}
 	return true
+}
+
+func (s *knowledgeService) markDomainCaptureFailed(ctx context.Context, id string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	s.domainStore.CaptureFailed(ctx, id)
 }

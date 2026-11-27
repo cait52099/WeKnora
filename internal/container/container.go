@@ -140,6 +140,12 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(initLangfuse))
 	must(container.Provide(initDatabase))
 	must(container.Provide(initDomainStore))
+	must(container.Provide(func(store *domainengine.Store, models interfaces.ModelService) *domainengine.Worker {
+		if store == nil {
+			return nil
+		}
+		return &domainengine.Worker{Store: store, Models: service.DomainModels{Service: models}}
+	}))
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))
 	must(container.Provide(initAntsPool))
@@ -530,6 +536,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 		must(container.Provide(router.NewMaintenanceAsynqServer, dig.Name("maintenanceAsynqServer")))
 		must(container.Provide(router.NewSharedAsynqServer, dig.Name("sharedAsynqServer")))
 		must(container.Provide(router.NewWikiAsynqServer, dig.Name("wikiAsynqServer")))
+		must(container.Provide(router.NewDomainAsynqServer, dig.Name("domainAsynqServer")))
 		// Asynq inspector for cancel-by-knowledge-id (best-effort
 		// dequeue of pending/scheduled/retry tasks + active-task cancel).
 		must(container.Provide(router.NewAsynqInspector))
@@ -821,6 +828,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(router.NewRouter))
 	if redisAvailable {
 		must(container.Invoke(router.RunAsynqServer))
+		must(container.Invoke(startDomainDispatcher))
 	} else {
 		must(container.Invoke(router.RegisterSyncHandlers))
 	}
@@ -1008,8 +1016,34 @@ func initRedisClient() (*redis.Client, error) {
 	return client, nil
 }
 
+func startDomainDispatcher(worker *domainengine.Worker, queue interfaces.TaskEnqueuer, cleaner interfaces.ResourceCleaner) {
+	if worker == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	cleaner.Register(func() error { cancel(); <-done; return nil })
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			run, stop := context.WithTimeout(ctx, 4*time.Second)
+			if err := worker.Dispatch(run, queue); err != nil && ctx.Err() == nil {
+				logger.Warnf(ctx, "domain dispatcher tick failed")
+			}
+			stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
 func initDomainStore(db *gorm.DB) (*domainengine.Store, error) {
-	if os.Getenv("DOMAIN_ENGINE_ENABLED") != "true" || db.Dialector.Name() != "postgres" {
+	if os.Getenv("DOMAIN_ENGINE_ENABLED") != "true" || os.Getenv("REDIS_ADDR") == "" || db.Dialector.Name() != "postgres" {
 		return nil, nil
 	}
 	sqlDB, err := db.DB()

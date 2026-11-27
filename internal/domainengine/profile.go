@@ -36,12 +36,15 @@ type Profile struct {
 }
 
 type StageDefinition struct {
-	ID       string                `json:"id"`
-	Optional bool                  `json:"optional,omitempty"`
-	Inputs   map[string]StageInput `json:"inputs"`
-	Prompt   string                `json:"prompt"`
-	Schema   json.RawMessage       `json:"schema"`
-	ModelRef string                `json:"model_ref"`
+	Partition      *ArrayPartition       `json:"partition,omitempty"`
+	SemanticChecks []SemanticCheck       `json:"semantic_checks,omitempty"`
+	ID             string                `json:"id"`
+	Optional       bool                  `json:"optional,omitempty"`
+	Enabled        bool                  `json:"enabled,omitempty"`
+	Inputs         map[string]StageInput `json:"inputs"`
+	Prompt         string                `json:"prompt"`
+	Schema         json.RawMessage       `json:"schema"`
+	ModelRef       string                `json:"model_ref"`
 }
 
 type InputSource string
@@ -134,14 +137,17 @@ func validateStage(stage StageDefinition, previous map[string]StageDefinition) e
 			}
 		case InputOutput:
 			dependency, found := previous[input.StageID]
-			if !found || (dependency.Optional && !stage.Optional) {
+			if !found || (dependency.Optional && (!stage.Optional || (stage.Enabled && !dependency.Enabled))) {
 				return fmt.Errorf("input %q needs an available earlier stage", name)
 			}
 		default:
 			return fmt.Errorf("input %q has an unknown source", name)
 		}
 	}
-	return nil
+	if err := validateSemanticChecks(stage); err != nil {
+		return err
+	}
+	return validatePartition(stage)
 }
 
 type offlineLoader struct{}

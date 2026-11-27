@@ -25,3 +25,7 @@ Vue 复用原生文件/拖放入口，KB 设置增加可用的领域配置与阶
 Phase 2A 提供内部配置校验与持久层；Phase 2B 才发布本地领域模板导入、Stage 配置、任务状态与 JSON 预览接口及基础 UI。界面区分解析覆盖、模型实际输入、抽取质量及结构化记录/检索/图谱的就绪状态。简易模式通过可选草案生成接口接入，编辑、审核及发布前的校验与手动模式一致。
 
 2A Go 接口提供 `ImportProfile(io.Reader)`、分阶段 `ValidateOutput` 与 `StageFingerprints`，以及发布、读取和绑定版本的持久层。该接口只能由已完成授权的后端代码调用。浏览器、CLI 与 Agent 均不直连该持久层。
+
+## Phase 2B 实际接口
+
+工作区会话管理员可列出及读取发布修订，调用 `/domain-profiles/{validate,publish}` 和 `/domain-profiles/preview/{txt,docx,example}`。草稿编辑、复制和文件导出在浏览器完成。绑定和任务端点位于 `/knowledge-bases/:id/domain`，沿用 KB owner/admin 与 write grant。任务提供 `/jobs/:job/{runs,parse,retry,cancel,reprocess}` 和 `/runs/:attempt/{raw,valid}`。源文档预览使用现有知识详情权限。操作步骤见 [MVP 指南](MVP_GUIDE.md)。

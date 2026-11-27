@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/chunker"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -269,11 +270,19 @@ func (s *knowledgeService) createKnowledgeFromFile(ctx context.Context,
 		return knowledge, nil
 	}
 
-	task := asynq.NewTask(
-		types.TypeDocumentProcess,
-		payloadBytes,
-		documentProcessTaskOptions(s.config, asynq.MaxRetry(3))...,
-	)
+	if s.domainStore != nil {
+		scope := domainengine.Scope{TenantID: tenantID, KBID: kbID}
+		if err := s.domainStore.Start(ctx, scope, knowledge.ID, filePath, knowledge.FileHash, DomainModels{Service: s.modelService}, payloadBytes); err != nil {
+			logger.Warnf(ctx, "could not record domain processing intent for %s", knowledge.ID)
+		}
+	}
+
+	taskOptions := documentProcessTaskOptions(s.config, asynq.MaxRetry(3))
+	if s.domainStore != nil {
+		taskOptions = append(taskOptions, asynq.TaskID(domainengine.NativeTaskID(knowledge.ID, filePath, knowledge.FileHash)))
+	}
+	task := asynq.NewTask(types.TypeDocumentProcess, payloadBytes, taskOptions...)
+
 	info, err := s.task.Enqueue(task)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue document process task: %v", err)

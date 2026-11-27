@@ -13,6 +13,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/common"
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/middleware/asynqdl"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
@@ -24,6 +25,10 @@ import (
 
 type AsynqTaskParams struct {
 	dig.In
+	DomainWorker *domainengine.Worker `optional:"true"`
+
+	DomainServer *asynq.Server              `name:"domainAsynqServer" optional:"true"`
+	Cleaner      interfaces.ResourceCleaner `optional:"true"`
 
 	// Dedicated servers provide minimum capacity for parse, post-process,
 	// enrichment, maintenance, and Wiki work. SharedServer is the elastic tier:
@@ -227,6 +232,13 @@ func NewWikiAsynqServer(svc interfaces.SystemSettingService) *asynq.Server {
 	return newAsynqServer(concurrency, types.QueueWeightsForPool(types.WorkerPoolWiki))
 }
 
+func NewDomainAsynqServer(worker *domainengine.Worker) *asynq.Server {
+	if worker == nil {
+		return nil
+	}
+	return newAsynqServer(2, map[string]int{domainengine.Queue: 1})
+}
+
 func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Create a new mux and register all handlers
 	mux := asynq.NewServeMux()
@@ -305,6 +317,9 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 
 	// Register knowledge post process handler
 	mux.HandleFunc(types.TypeKnowledgePostProcess, params.KnowledgePostProcess.Handle)
+	if params.DomainWorker != nil {
+		mux.HandleFunc(domainengine.TaskType, params.DomainWorker.Handle)
+	}
 	mux.HandleFunc(types.TypeKnowledgeAutoTag, params.KnowledgeAutoTag.Handle)
 	mux.HandleFunc(types.TypeKnowledgeBaseProfile, params.KnowledgeBaseProfile.Handle)
 
@@ -335,6 +350,12 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	runPool("maintenance-pool", params.MaintenanceServer)
 	runPool("shared-pool", params.SharedServer)
 	runPool("wiki-pool", params.WikiServer)
+	if params.DomainServer != nil {
+		if params.Cleaner != nil {
+			params.Cleaner.Register(func() error { params.DomainServer.Shutdown(); return nil })
+		}
+		runPool("domain-pool", params.DomainServer)
+	}
 	return mux
 }
 

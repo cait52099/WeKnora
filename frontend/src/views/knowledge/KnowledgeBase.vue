@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import DomainStudio from "./domain/DomainStudio.vue"
 import { useAssistantDataChange } from '@/utils/assistantDataChange';
 import { ref, onMounted, onUnmounted, watch, reactive, computed, nextTick } from "vue";
 import { MessagePlugin } from "tdesign-vue-next";
@@ -2509,6 +2510,7 @@ const handleKBEditorSuccess = (kbIdValue: string) => {
             </h2>
             <!-- 标题行右侧的动作锚点：聚拢"信息"和"设置"两个圆形按钮。 -->
             <div class="kb-title-actions">
+              <DomainStudio v-if="canManage && kbId && !authStore.isLiteMode" :key="kbId" :kb-id="kbId" @open-source="openSourceDoc" />
               <KBInfoPopover v-if="kbInfo && !authStore.isLiteMode" :kb-info="kbInfo"
                 :supported-file-types="[...supportedFileTypes]" />
               <t-tooltip v-if="canManage" :content="$t('knowledgeBase.settings')" placement="top">

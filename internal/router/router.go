@@ -16,6 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/operations"
 	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -30,6 +31,7 @@ import (
 // RouterParams 路由参数
 type RouterParams struct {
 	dig.In
+	DomainWorker *domainengine.Worker `optional:"true"`
 
 	Config                       *config.Config
 	FileService                  interfaces.FileService
@@ -299,6 +301,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 		)
 		RegisterKnowledgeTagRoutes(v1, params.TagHandler, rbacGuards)
 		RegisterKnowledgeRoutes(v1, params.KnowledgeHandler, rbacGuards)
+		registerDomainRoutes(v1, rbacGuards, params.DomainWorker, params.KnowledgeService)
 		RegisterGraphSearchRoutes(v1, params.GraphSearchHandler, rbacGuards)
 		RegisterFAQRoutes(v1, params.FAQHandler, rbacGuards)
 		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)

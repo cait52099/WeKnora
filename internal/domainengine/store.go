@@ -20,16 +20,17 @@ type Store struct{ db *sql.DB }
 func NewStore(db *sql.DB) *Store { return &Store{db: db} }
 
 type Scope struct {
-	TenantID uint64
-	KBID     string
+	TenantID uint64 `json:"tenant_id"`
+	KBID     string `json:"kb_id"`
 }
 
 type Binding struct {
 	Scope
-	Version   int64
-	ProfileID string
-	Revision  string
-	Enabled   bool
+	Version     int64  `json:"version"`
+	ProfileID   string `json:"profile_id"`
+	Revision    string `json:"revision"`
+	Enabled     bool   `json:"enabled"`
+	AccessEpoch int64  `json:"-"`
 }
 
 func (s *Store) Publish(ctx context.Context, tenant uint64, p *CompiledProfile) error {

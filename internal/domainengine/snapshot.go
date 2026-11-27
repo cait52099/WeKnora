@@ -44,6 +44,7 @@ type SnapshotKey struct {
 }
 
 type ParseSnapshot struct {
+	JobID              string                 `json:"-"`
 	Binding            Binding                `json:"-"`
 	DocumentID         string                 `json:"-"`
 	Attempt            int                    `json:"-"`
@@ -91,14 +92,21 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap ParseSnapshot) error {
 	defer tx.Rollback()
 
 	var documentID string
+	guard := `AND b.version=$6 AND b.profile_id=$7 AND b.revision=$8 AND b.enabled`
+	args := []any{b.TenantID, b.KBID, snap.DocumentID, snap.FilePath, snap.NativeFileHash, b.Version, b.ProfileID, b.Revision}
+	if snap.JobID != "" {
+		guard = `AND b.enabled AND EXISTS (SELECT 1 FROM domain_engine.jobs j WHERE j.id=$9 AND j.tenant_id=b.tenant_id
+ AND j.kb_id=b.kb_id AND j.document_id=k.id AND j.source_path=k.file_path AND j.native_hash=k.file_hash
+ AND j.binding_version=$6 AND j.profile_id=$7 AND j.revision=$8 AND j.access_epoch=b.access_epoch
+ AND j.status IN ('waiting_parse','capture_failed'))`
+		args = append(args, snap.JobID)
+	}
 	err = tx.QueryRowContext(ctx, `SELECT k.id FROM knowledges k
 		JOIN knowledge_bases kb ON kb.id=k.knowledge_base_id AND kb.tenant_id=k.tenant_id
 		JOIN domain_engine.kb_bindings b ON b.kb_id=kb.id AND b.tenant_id=kb.tenant_id
 		WHERE k.tenant_id=$1 AND kb.id=$2 AND k.id=$3 AND k.file_path=$4 AND k.file_hash=$5
 		AND k.deleted_at IS NULL AND kb.deleted_at IS NULL AND k.parse_status NOT IN ('deleting','cancelled')
-		AND b.version=$6 AND b.profile_id=$7 AND b.revision=$8 AND b.enabled
-		FOR UPDATE OF k, kb, b`, b.TenantID, b.KBID, snap.DocumentID, snap.FilePath, snap.NativeFileHash,
-		b.Version, b.ProfileID, b.Revision).Scan(&documentID)
+		`+guard+` FOR UPDATE OF k, kb, b`, args...).Scan(&documentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrStaleSource
 	}
@@ -139,6 +147,20 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap ParseSnapshot) error {
 	}
 	if sourceHash != actualSource || snapshotHash != actualSnapshot {
 		return ErrConflict
+	}
+	if snap.JobID != "" {
+		result, err := tx.ExecContext(ctx, `UPDATE domain_engine.jobs SET parse_attempt=$2,snapshot_binding_version=binding_version,status='queued',error_code='',
+			due_at=now(),wake_at=now() WHERE id=$1 AND status IN ('waiting_parse','capture_failed')`, snap.JobID, snap.Attempt)
+		if err != nil {
+			return err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return ErrStaleSource
+		}
 	}
 	return tx.Commit()
 }
