@@ -81,7 +81,7 @@ func newLiteTransferHarness(t *testing.T) *liteTransferHarness {
 		chunkSvc, chunkRepository, tagRepository, nil,
 		localFiles, nil, nil, nil, syncExec, nil, nil, nil, nil,
 		nil, // redisClient == nil
-		nil, nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil, nil, nil, nil,
 	)
 	require.NoError(t, err)
 

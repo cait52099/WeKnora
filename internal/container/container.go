@@ -76,6 +76,7 @@ import (
 	rssConnector "github.com/Tencent/WeKnora/internal/datasource/connector/rss"
 	seafileConnector "github.com/Tencent/WeKnora/internal/datasource/connector/seafile"
 	yuqueConnector "github.com/Tencent/WeKnora/internal/datasource/connector/yuque"
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
@@ -138,6 +139,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(config.LoadConfig))
 	must(container.Provide(initLangfuse))
 	must(container.Provide(initDatabase))
+	must(container.Provide(initDomainStore))
 	must(container.Provide(initFileService))
 	must(container.Provide(initRedisClient))
 	must(container.Provide(initAntsPool))
@@ -1004,6 +1006,17 @@ func initRedisClient() (*redis.Client, error) {
 	}
 
 	return client, nil
+}
+
+func initDomainStore(db *gorm.DB) (*domainengine.Store, error) {
+	if os.Getenv("DOMAIN_ENGINE_ENABLED") != "true" || db.Dialector.Name() != "postgres" {
+		return nil, nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	return domainengine.NewStore(sqlDB), nil
 }
 
 // initDatabase initializes database connection

@@ -4223,6 +4223,8 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		return nil
 	}
 
+	ctx, domainCapture := s.beginDomainCapture(ctx, payload, knowledge, attempt)
+
 	// New pipeline: convert -> store images -> chunk -> vectorize -> multimodal tasks
 	var convertResult *types.ReadResult
 	var chunks []types.ParsedChunk
@@ -4510,6 +4512,10 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		sourceIndex = buildSourceIndex(parsedMarkdown, sourceBlocks, convertResult.MarkdownContent, storedImages)
 	}
 
+	if domainCapture != nil {
+		s.finishDomainCapture(ctx, domainCapture, parsedMarkdown, sourceBlocks, convertResult, storedImages)
+	}
+
 	// Step 3: Split into chunks using Go chunker. Line endings and inline
 	// HTML tables were normalized before image resolution above.
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
@@ -4701,6 +4707,8 @@ func (s *knowledgeService) convert(
 		req.FileName = payload.FileName
 		req.FileType = fileType
 	}
+
+	recordDomainParserInput(ctx, req, eff.ASRConfig.ModelID)
 
 	result, err := s.callDocReaderWithTimeout(ctx, reader, req)
 	if err == nil && result == nil {

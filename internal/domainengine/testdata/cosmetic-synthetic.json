@@ -1,0 +1,101 @@
+{
+  "id": "cosmetic-synthetic",
+  "revision": "1.0.0",
+  "name": "Cosmetic Synthetic",
+  "stages": [
+    {
+      "id": "extract",
+      "model_ref": "mock-extractor",
+      "prompt": "For the synthetic fixture, list reported formula_groups. Return JSON only.",
+      "inputs": {
+        "source": {
+          "source": "document"
+        }
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": [
+          "formula_groups"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "formula_groups": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "group_code",
+                "mixing_temperature_c"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "group_code": {
+                  "type": "string"
+                },
+                "mixing_temperature_c": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "analyze",
+      "model_ref": "mock-analyzer",
+      "prompt": "From the extraction JSON only, list synthetic study_observations. Return JSON only.",
+      "inputs": {
+        "extraction": {
+          "source": "stage_output",
+          "stage_id": "extract"
+        }
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": [
+          "study_observations"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "study_observations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "source_code",
+                "label"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source_code": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "classifications": {
+    "record_types": [
+      "formula_groups",
+      "study_observations"
+    ]
+  },
+  "mappings": {
+    "records": [
+      {
+        "stage_id": "analyze",
+        "pointer": "/study_observations",
+        "type": "study_observations"
+      }
+    ]
+  }
+}
