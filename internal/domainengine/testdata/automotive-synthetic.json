@@ -1,0 +1,101 @@
+{
+  "id": "automotive-synthetic",
+  "revision": "1.0.0",
+  "name": "Automotive Synthetic",
+  "stages": [
+    {
+      "id": "extract",
+      "model_ref": "mock-extractor",
+      "prompt": "For the synthetic fixture, list reported vehicle_platforms. Return JSON only.",
+      "inputs": {
+        "source": {
+          "source": "document"
+        }
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": [
+          "vehicle_platforms"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "vehicle_platforms": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "platform_code",
+                "cycle_count"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "platform_code": {
+                  "type": "string"
+                },
+                "cycle_count": {
+                  "type": "number"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "analyze",
+      "model_ref": "mock-analyzer",
+      "prompt": "From the extraction JSON only, list synthetic failure_modes. Return JSON only.",
+      "inputs": {
+        "extraction": {
+          "source": "stage_output",
+          "stage_id": "extract"
+        }
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": [
+          "failure_modes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "failure_modes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "source_code",
+                "label"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "source_code": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "classifications": {
+    "record_types": [
+      "vehicle_platforms",
+      "failure_modes"
+    ]
+  },
+  "mappings": {
+    "records": [
+      {
+        "stage_id": "analyze",
+        "pointer": "/failure_modes",
+        "type": "failure_modes"
+      }
+    ]
+  }
+}

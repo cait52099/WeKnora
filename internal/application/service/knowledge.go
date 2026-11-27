@@ -15,6 +15,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/domainengine"
 	werrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -51,6 +52,7 @@ var (
 // knowledgeService implements the knowledge service interface
 // service 实现知识服务接口
 type knowledgeService struct {
+	domainStore     *domainengine.Store
 	config          *config.Config
 	retrieveEngine  interfaces.RetrieveEngineRegistry
 	ownership       retriever.TenantStoreOwnership
@@ -128,8 +130,10 @@ func NewKnowledgeService(
 	taskPendingRepo interfaces.TaskPendingOpsRepository,
 	spanTracker SpanTracker,
 	audit interfaces.AuditLogService,
+	domainStore *domainengine.Store,
 ) (interfaces.KnowledgeService, error) {
 	return &knowledgeService{
+		domainStore:     domainStore,
 		config:          config,
 		repo:            repo,
 		kbService:       kbService,
